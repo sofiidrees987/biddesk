@@ -1,0 +1,585 @@
+// BidDesk — Capture, proposals and contracts for government contractors.
+// SQLite datasource: JSON-valued attributes are stored as strings (*Json suffix)
+// and validated/parsed at the API boundary with Zod. Money is stored as integer
+// cents; rates and percentages as integer basis points (1% = 100 bps).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy, identity, collaboration
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id             String   @id @default(cuid())
+  name           String
+  legalName      String
+  uei            String
+  cage           String
+  samExpiry      DateTime?
+  primaryNaics   String
+  naicsListJson  String   @default("[]") // string[]
+  sizeStandard   String
+  certificationsJson String @default("[]") // {name, expiry?}[]
+  vehiclesJson   String   @default("[]") // {name, number}[]
+  facilityClearance String @default("None")
+  dcaaStatus     String   @default("Not reviewed")
+  sprsScore      Int?
+  sprsDate       DateTime?
+  targetAgency   String
+  pwinWeightsJson String  @default("[]") // {key,label,weight}[]
+  gateCriteriaJson String @default("[]") // {key,label,weight}[]
+  firstRunDone   Boolean  @default(false)
+  walkthroughSeen Boolean @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model User {
+  id        String   @id @default(cuid())
+  orgId     String
+  email     String   @unique
+  name      String
+  role      String // Owner|Admin|Capture Manager|Proposal Manager|Contracts Manager|Pricing Analyst|Contributor|Reviewer|Read-only
+  title     String
+  initials  String
+  passwordHash String @default("")
+  mfaEnabled Boolean @default(false)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions  Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  orgId     String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  orgId      String
+  userName   String
+  userRole   String
+  action     String // e.g. "pursuit.stage_changed", "requirement.confirmed"
+  entity     String
+  entityId   String
+  entityLabel String
+  detail     String   @default("")
+  createdAt  DateTime @default(now())
+}
+
+model Notification {
+  id         String   @id @default(cuid())
+  orgId      String
+  userId     String
+  kind       String // assignment|deadline|review|option|cpars|match|system
+  title      String
+  body       String
+  recordType String
+  recordId   String
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+}
+
+model Task {
+  id         String   @id @default(cuid())
+  orgId      String
+  title      String
+  detail     String   @default("")
+  assigneeId String
+  dueDate    DateTime
+  status     String // open|done
+  priority   String // high|medium|low
+  recordType String // proposal|pursuit|contract|library
+  recordId   String
+  recordLabel String
+  createdAt  DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Opportunities (SAM.gov-style notices; manual/CSV entry for state and local)
+// ---------------------------------------------------------------------------
+
+model Opportunity {
+  id              String   @id @default(cuid())
+  orgId           String
+  source          String // sam_gov|manual|csv
+  noticeType      String // presolicitation|sources_sought|solicitation|combined_synopsis|special_notice|award_notice
+  title           String
+  solicitationNumber String
+  agency          String
+  subTier         String
+  office          String
+  postedDate      DateTime
+  responseDeadline DateTime?
+  naics           String
+  psc             String
+  setAside        String // None|Small Business|SDVOSB|WOSB|8(a)|HUBZone
+  popCity         String
+  popState        String
+  description     String
+  estimatedValueCents Int?
+  valueLabel      String // e.g. "$4.5M" when published, "" otherwise
+  link            String
+  matchScore      Int      @default(0)
+  matchFactorsJson String  @default("[]") // {key,label,score,weight,detail}[]
+  status          String   @default("new") // new|tracked|dismissed
+  dismissedReason String
+  archived        Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  pursuits        Pursuit[]
+}
+
+model SavedSearch {
+  id         String   @id @default(cuid())
+  orgId      String
+  name       String
+  criteriaJson String // {keyword?, noticeTypes?, naics?, setAsides?, states?, maxAgeDays?}
+  alertsEnabled Boolean @default(true)
+  digest     String   @default("daily") // off|daily|weekly
+  createdAt  DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Capture / pipeline
+// ---------------------------------------------------------------------------
+
+model Pursuit {
+  id              String   @id @default(cuid())
+  orgId           String
+  opportunityId   String?
+  title           String
+  agency          String
+  stage           String // identified|qualifying|capture|bid_decision|proposal|submitted|won|lost
+  captureLead     String
+  expectedValueCents Int
+  totalValueCents Int
+  pwin            Int      @default(50)
+  pwinFactors     PwinFactor[]
+  gateStatus      String   @default("pending") // pending|approved|rejected
+  gateDecision    String // Bid|No-Bid once decided
+  gateScoreJson   String   @default("[]") // {key,label,score(1-5),weight,comment}[]
+  gateApprovedBy  String
+  gateApprovedAt  DateTime?
+  decisionDate    DateTime?
+  winThemesJson   String   @default("[]") // string[]
+  noBidReason     String
+  competitorNote  String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  opportunity     Opportunity? @relation(fields: [opportunityId], references: [id])
+  teaming         TeamingAgreement[]
+  proposals       Proposal[]
+  wonContracts    Contract[]
+}
+
+model PwinFactor {
+  id        String   @id @default(cuid())
+  pursuitId String
+  key       String // customer_relationship|solution_fit|incumbent_position|price_competitiveness|past_performance|teaming_strength
+  label     String
+  score     Int // 0-100
+  weight    Int // percentage weight
+  detail    String @default("")
+  pursuit   Pursuit @relation(fields: [pursuitId], references: [id], onDelete: Cascade)
+}
+
+model Partner {
+  id             String   @id @default(cuid())
+  orgId          String
+  name           String
+  uei            String
+  capabilities   String
+  certifications String // "SDVOSB, Small Business"
+  location       String
+  naics          String
+  ndaStatus      String // none|executed|expired
+  taStatus       String // none|negotiating|executed
+  performanceRating Int  @default(0) // 0-5
+  notes          String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  teaming        TeamingAgreement[]
+}
+
+model TeamingAgreement {
+  id         String   @id @default(cuid())
+  orgId      String
+  pursuitId  String
+  partnerId  String
+  role       String // Prime|Subcontractor|Joint Venture
+  worksharePct Int
+  ndaStatus  String
+  taStatus   String
+  createdAt  DateTime @default(now())
+
+  pursuit    Pursuit @relation(fields: [pursuitId], references: [id], onDelete: Cascade)
+  partner    Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Proposals
+// ---------------------------------------------------------------------------
+
+model Proposal {
+  id           String   @id @default(cuid())
+  orgId        String
+  pursuitId    String?
+  title        String
+  solicitationNumber String
+  agency       String
+  status       String // intake|requirements|writing|review|submitted|won|lost
+  dueAt        DateTime
+  contractType String
+  notes        String   @default("")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  requirements  Requirement[]
+  sections      ProposalSection[]
+  reviewCycles  ReviewCycle[]
+  pursuit       Pursuit? @relation(fields: [pursuitId], references: [id])
+  pricingModels PricingModel[]
+}
+
+model Requirement {
+  id             String   @id @default(cuid())
+  proposalId     String
+  ref            String // L-3.2, M-1.1, PWS-4.1, CDRL-A001, FAR-52.219-1
+  text           String
+  obligation     String // shall|should|may
+  kind           String // instruction|evaluation|sow_task|deliverable|clause
+  sourceDoc      String // e.g. "Section L", "PWS", "CDRL A001"
+  page           Int
+  paragraph      String
+  sourceExcerpt  String // original passage shown in the citation panel
+  confidence     Int // 0-100
+  status         String // extracted|confirmed|edited|rejected
+  sectionKey     String // outline node it is mapped to
+  owner          String
+  proposal       Proposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+}
+
+model ProposalSection {
+  id           String   @id @default(cuid())
+  proposalId   String
+  volume       String // Technical|Management|Past Performance|Price
+  key          String // stable key, e.g. "tech-3"
+  title        String
+  instructions String
+  pageLimit    Int?
+  content      String   @default("")
+  assignee     String
+  dueDate      DateTime?
+  status       String // not_started|drafting|in_review|final
+  order        Int
+  winTheme     String
+  proposal     Proposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+}
+
+model ReviewCycle {
+  id          String   @id @default(cuid())
+  proposalId  String
+  kind        String // blue|pink|red|gold
+  status      String // scheduled|in_progress|complete
+  scheduledAt DateTime
+  summaryJson String   @default("{}") // {avgScore, findingsOpen, notes}
+  proposal    Proposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  findings    ReviewFinding[]
+}
+
+model ReviewFinding {
+  id           String   @id @default(cuid())
+  reviewId     String
+  proposalId   String
+  sectionKey   String
+  severity     String // blocker|major|minor
+  comment      String
+  disposition  String // open|accepted|rejected|deferred
+  response     String
+  review       ReviewCycle @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+}
+
+model AiGeneration {
+  id         String   @id @default(cuid())
+  orgId      String
+  userName   String
+  kind       String // section_draft|assistant
+  target     String
+  sourcesJson String  @default("[]")
+  output     String
+  accepted   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Pricing
+// ---------------------------------------------------------------------------
+
+model RateSet {
+  id          String   @id @default(cuid())
+  orgId       String
+  name        String
+  effectiveDate DateTime
+  fringeBps   Int
+  overheadBps Int // contractor-site labor overhead
+  overheadGovBps Int // government-site labor overhead
+  materialHandlingBps Int
+  gaBps       Int
+  feeBps      Int
+  source      String // FPRA|Provisional|Actual
+  status      String @default("active")
+  createdAt   DateTime @default(now())
+
+  laborCategories LaborCategory[]
+}
+
+model LaborCategory {
+  id          String   @id @default(cuid())
+  rateSetId   String
+  title       String
+  description String
+  baseRateCents Int
+  clearance   String
+  minYears    Int
+  benchmarkLowCents  Int
+  benchmarkHighCents Int
+  rateSet     RateSet @relation(fields: [rateSetId], references: [id], onDelete: Cascade)
+}
+
+model PricingModel {
+  id           String   @id @default(cuid())
+  orgId        String
+  proposalId   String?
+  name         String
+  contractType String // FFP|T&M|LH|CPFF|CPAF|FPIF|IDIQ|BPA
+  escalationBps Int
+  periodsJson  String // {label,startDate,endDate,months}[]
+  status       String @default("draft") // draft|final
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  lines        PricingLine[]
+  clins        Clin[]
+  proposal     Proposal? @relation(fields: [proposalId], references: [id])
+}
+
+model PricingLine {
+  id          String   @id @default(cuid())
+  modelId     String
+  lcatId      String
+  lcatTitle   String
+  periodIndex Int
+  hours       Int
+  kind        String // labor|odc|travel|material|sub
+  unitCostCents Int?
+  clinRef     String
+  model       PricingModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+}
+
+model Clin {
+  id           String   @id @default(cuid())
+  orgId        String
+  modelId      String?
+  contractId   String?
+  ref          String // 0001 / 0001AA
+  name         String
+  type         String // ffp|tm|lh|cost|odc
+  periodLabel  String
+  quantity     Int      @default(1)
+  unitPriceCents Int
+  valueCents   Int
+  fundedCents  Int      @default(0)
+  model        PricingModel? @relation(fields: [modelId], references: [id])
+  contract     Contract? @relation(fields: [contractId], references: [id])
+}
+
+// ---------------------------------------------------------------------------
+// Contracts (post-award)
+// ---------------------------------------------------------------------------
+
+model Contract {
+  id            String   @id @default(cuid())
+  orgId         String
+  pursuitId     String?
+  number        String
+  vehicle       String
+  type          String // prime|task_order|bpa_call|subcontract
+  agency        String
+  coName        String
+  corName       String
+  status        String // active|option_pending|expiring|closed
+  awardDate     DateTime
+  startDate     DateTime
+  endDate       DateTime
+  popLabel      String
+  ceilingCents  Int
+  obligatedCents Int
+  fundedCents   Int
+  closeoutJson  String   @default("[]") // {label, done}[]
+  pastPerformanceAdded Boolean @default(false)
+  pursuit       Pursuit? @relation(fields: [pursuitId], references: [id])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  clins          Clin[]
+  deliverables   Deliverable[]
+  modifications  Modification[]
+  options        OptionPeriod[]
+  cpars          CparsEvaluation[]
+  invoices       InvoiceLog[]
+  subcontractors Subcontractor[]
+}
+
+model Deliverable {
+  id           String   @id @default(cuid())
+  contractId   String
+  title        String
+  didRef       String
+  frequency    String
+  nextDue      DateTime?
+  status       String // not_due|due_soon|submitted|accepted|late
+  lastSubmitted DateTime?
+  recipients   String
+  contract     Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+}
+
+model Modification {
+  id           String   @id @default(cuid())
+  contractId   String
+  number       String
+  type         String // administrative|funding|option_exercise|scope|pop_extension|other
+  effectiveDate DateTime
+  valueDeltaCents Int
+  description  String
+  createdAt    DateTime @default(now())
+  contract     Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+}
+
+model OptionPeriod {
+  id           String   @id @default(cuid())
+  contractId   String
+  label        String
+  exerciseBy   DateTime
+  preliminaryNoticeBy DateTime?
+  exercised    Boolean  @default(false)
+  exercisedAt  DateTime?
+  modNumber    String
+  contract     Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+}
+
+model CparsEvaluation {
+  id           String   @id @default(cuid())
+  contractId   String
+  periodLabel  String
+  status       String // pending|draft|submitted|accepted
+  overallRating String // Exceptional|Very Good|Satisfactory|Marginal|Unsatisfactory|"" 
+  ratingsJson  String   @default("[]") // {factor, rating}[]
+  narrative    String
+  responseDue  DateTime?
+  contractorComment String
+  contract     Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+}
+
+model InvoiceLog {
+  id         String   @id @default(cuid())
+  contractId String
+  reference  String
+  period     String
+  amountCents Int
+  status     String // draft|submitted|approved|paid
+  contract   Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+}
+
+model Subcontractor {
+  id         String   @id @default(cuid())
+  contractId String
+  name       String
+  valueCents Int
+  smallBusiness Boolean @default(false)
+  contract   Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Library (company assets used for grounded drafting)
+// ---------------------------------------------------------------------------
+
+model PastPerformance {
+  id         String   @id @default(cuid())
+  orgId      String
+  customer   String
+  contractNumber String
+  title      String
+  valueCents Int
+  startDate  DateTime
+  endDate    DateTime
+  role       String // prime|sub
+  naics      String
+  psc        String
+  tagsJson   String   @default("[]") // capability tags
+  narrative  String
+  outcomes   String
+  cparsRating String
+  referenceName String
+  referenceContact String
+  referencePermission String @default("granted")
+  status     String   @default("approved") // approved|draft
+  createdAt  DateTime @default(now())
+}
+
+model Resume {
+  id           String   @id @default(cuid())
+  orgId        String
+  name         String
+  title        String
+  lcat         String
+  clearance    String
+  certificationsJson String @default("[]")
+  years        Int
+  availability String
+  summary      String
+  status       String   @default("approved")
+  createdAt    DateTime @default(now())
+}
+
+model LibraryItem {
+  id         String   @id @default(cuid())
+  orgId      String
+  category   String // boilerplate|policy|template
+  title      String
+  content    String
+  tagsJson   String   @default("[]")
+  status     String   @default("approved") // draft|approved|archived
+  owner      String
+  reviewBy   DateTime?
+  useCount   Int      @default(0)
+  createdAt  DateTime @default(now())
+}
+
+model Integration {
+  id        String   @id @default(cuid())
+  orgId     String
+  key       String // sam_gov|ai_assistant|smtp|usaspending|gsa_calc|m365
+  name      String
+  status    String // configured|disabled|error
+  reason    String
+  detail    String
+  updatedAt DateTime @updatedAt
+}
